@@ -167,12 +167,6 @@ impl Client {
     fn check_url(&self, url: &Url) -> Result<(), Error> {
         check_url(self.policy, self.allow_plaintext, url)
     }
-
-    /// The underlying client, for callers that need features this wrapper does
-    /// not expose. The address policy still applies.
-    pub fn inner(&self) -> &reqwest::Client {
-        &self.inner
-    }
 }
 
 /// Resolves a name and drops any address the policy refuses.

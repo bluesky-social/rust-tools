@@ -127,9 +127,22 @@ impl Directory {
     }
 
     /// Drop a cached identity immediately.
+    ///
+    /// The generation exists so a resolution that was already in flight when
+    /// `purge` ran cannot write its (possibly pre-purge) answer back into the
+    /// cache: it captured the old generation and `cached` refuses entries from
+    /// an older one. Entries already cached are re-stamped to the new
+    /// generation, so purging one DID does not invalidate every other identity.
     pub fn purge(&self, did: &Did) {
-        self.cache.lock().expect("directory cache lock").remove(did);
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        let mut cache = self.cache.lock().expect("directory cache lock");
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        cache.remove(did);
+        for entry in cache.values_mut() {
+            entry.generation = generation;
+        }
     }
 
     /// Number of cached identities. Intended for tests and diagnostics.

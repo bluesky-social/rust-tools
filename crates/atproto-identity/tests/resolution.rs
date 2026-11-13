@@ -10,9 +10,11 @@ use egress::AddressPolicy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const DOC: &str = r##"{"id":"did:plc:ewvi7nxzyoun6zhxrhs64oiz","alsoKnownAs":["at://alice.example.com"],"service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}]}"##;
+const DOC: &str = r##"{"id":"{did}","alsoKnownAs":["at://alice.example.com"],"service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}]}"##;
 
-/// A PLC directory that answers any `did:plc:*` path with `DOC` and counts hits.
+/// A PLC directory that answers any `did:plc:*` path with `doc` and counts hits.
+/// `{did}` in the template is replaced with the DID from the request path, the
+/// way a real directory answers per-DID.
 async fn plc(doc: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -26,8 +28,15 @@ async fn plc(doc: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
             counter.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
-                let _ = socket.read(&mut buf).await;
-                let body = doc;
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let did = path.trim_start_matches('/');
+                let body: String = doc.replace("{did}", did);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
@@ -134,4 +143,30 @@ async fn denies_private_hosts_under_the_default_policy() {
         rendered.contains("refused") || rendered.contains("scheme"),
         "unexpected: {err}"
     );
+}
+
+#[tokio::test]
+async fn purging_one_did_keeps_the_others_cached() {
+    // `purge` is a takedown-shaped operation: it must not turn into a cache
+    // flush that sends every other DID back to the directory.
+    let (addr, hits) = plc(DOC).await;
+    let dir = directory(addr);
+    let a = Did::parse("did:plc:ewvi7nxzyoun6zhxrhs64oiz").expect("did");
+    let b = Did::parse("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").expect("did");
+
+    dir.lookup_did(&a).await.expect("first");
+    dir.lookup_did(&b).await.expect("second");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    dir.purge(&a);
+
+    dir.lookup_did(&b).await.expect("b still cached");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "purging a must not refetch b"
+    );
+
+    dir.lookup_did(&a).await.expect("a refetched");
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "purging a must refetch a");
 }

@@ -16,3 +16,18 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  msrv:
+    # The declared rust-version is a promise; check it against the locked graph
+    # rather than trusting it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked

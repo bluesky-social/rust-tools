@@ -69,11 +69,10 @@ fn v6_blocked(ip: Ipv6Addr) -> bool {
         || ip.is_unspecified()
         || ip.is_multicast()
         // RFC 4193 unique local (fc00::/7), including cloud metadata at
-        // fd00:ec2::254. Written out rather than using `is_unique_local` so
-        // the MSRV does not have to track std's stabilisation.
-        || (b[0] & 0xfe) == 0xfc
+        // fd00:ec2::254.
+        || ip.is_unique_local()
         // fe80::/10 link-local unicast.
-        || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)
+        || ip.is_unicast_link_local()
         || b[..12] == WELL_KNOWN_NAT64
         || b[..6] == LOCAL_NAT64
 }

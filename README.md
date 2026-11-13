@@ -31,8 +31,10 @@ runs and the connection goes straight to that address. `http://127.0.0.1/` and
 exists, and every resolved address at connect time. The second check is what
 makes it rebinding-safe — the addresses returned by the resolver are the
 addresses the connector dials, so a second DNS answer cannot redirect the
-connection. Redirects are off by default, and when enabled each hop is
-re-resolved and re-filtered.
+connection. Redirects are off by default. When enabled, **every hop is checked with the same
+rule as the first URL** — scheme and literal host — because a redirect is a
+second, attacker-chosen URL, and a public host can redirect straight to
+`https://169.254.169.254/`.
 
 The blocked set is the one our Go client uses, so two services behind the same
 edge cannot disagree about what "local" means: loopback, RFC 1918, link-local

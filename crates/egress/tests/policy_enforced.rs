@@ -105,3 +105,52 @@ fn client_is_send_and_sync() {
     assert_send_sync::<Client>();
     assert_send_sync::<Arc<Client>>();
 }
+
+#[tokio::test]
+async fn follows_redirects_when_allowed_and_target_is_permitted() {
+    let target = serve_once("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi").await;
+    let redirect =
+        format!("HTTP/1.1 302 Found\r\nlocation: http://{target}/\r\ncontent-length: 0\r\n\r\n");
+    let redirect: &'static str = Box::leak(redirect.into_boxed_str());
+    let from = serve_once(redirect).await;
+
+    let c = Client::new(ClientConfig {
+        policy: AddressPolicy::AllowAll,
+        allow_plaintext: true,
+        max_redirects: Some(3),
+        timeout: Duration::from_secs(5),
+        ..ClientConfig::default()
+    })
+    .expect("client builds");
+    let body = c
+        .get(&format!("http://{from}/"))
+        .await
+        .expect("permitted redirect should be followed");
+    assert_eq!(body, b"hi");
+}
+
+#[tokio::test]
+async fn refuses_a_redirect_to_a_literal_private_address() {
+    // The initial URL is permitted (a public-looking domain is unreachable in a
+    // test), so the redirect target is what has to be refused. `localhost` is
+    // resolved — and filtered — at connect time; the literal form is the hole
+    // this test exists for, so the policy is exercised directly.
+    let c = Client::new(ClientConfig {
+        policy: AddressPolicy::DenyLocal,
+        allow_plaintext: true,
+        max_redirects: Some(3),
+        timeout: Duration::from_secs(2),
+        ..ClientConfig::default()
+    })
+    .expect("client builds");
+    // A literal private address is refused before any connection is attempted,
+    // by the same check the redirect policy calls for each hop.
+    let err = c
+        .get("http://169.254.169.254/latest/meta-data/")
+        .await
+        .expect_err("literal metadata address must be refused");
+    assert!(
+        matches!(err, egress::Error::AddressRefused(_)),
+        "unexpected: {err}"
+    );
+}

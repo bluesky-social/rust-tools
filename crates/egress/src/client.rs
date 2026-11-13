@@ -76,9 +76,24 @@ impl Client {
     /// Build a client. Fails only if the underlying TLS backend cannot start.
     pub fn new(config: ClientConfig) -> Result<Self, Error> {
         let redirect = match config.max_redirects {
-            None => Policy::none(),
-            Some(0) => Policy::none(),
-            Some(n) => Policy::limited(n),
+            None | Some(0) => Policy::none(),
+            Some(max) => {
+                let policy = config.policy;
+                let allow_plaintext = config.allow_plaintext;
+                Policy::custom(move |attempt| {
+                    if attempt.previous().len() > max {
+                        return attempt.error("too many redirects");
+                    }
+                    // A redirect is a second, attacker-chosen URL. Everything the
+                    // first URL had to satisfy applies to it too — including the
+                    // literal-host check, since reqwest does not resolve IP
+                    // literals and would otherwise connect straight to one.
+                    match check_url(policy, allow_plaintext, attempt.url()) {
+                        Ok(()) => attempt.follow(),
+                        Err(err) => attempt.error(RedirectRefused(err.to_string())),
+                    }
+                })
+            }
         };
         let inner = reqwest::Client::builder()
             // The connection target check happens here, at connect time: the
@@ -141,7 +156,8 @@ impl Client {
         self.get_bytes(Url::parse(url)?).await
     }
 
-    /// Scheme and literal-host checks.
+    /// Scheme and literal-host checks, applied to the initial request and to
+    /// every redirect hop.
     ///
     /// The resolver hook only runs when a name has to be resolved. A URL whose
     /// host is already an IP literal never reaches it — reqwest connects
@@ -149,25 +165,7 @@ impl Client {
     /// happily fetch `http://127.0.0.1/` or `http://169.254.169.254/`. The
     /// literal has to be checked here, before the request exists.
     fn check_url(&self, url: &Url) -> Result<(), Error> {
-        match url.scheme() {
-            "https" => {}
-            "http" if self.allow_plaintext => {}
-            other => {
-                return Err(Error::Scheme {
-                    scheme: other.to_owned(),
-                });
-            }
-        }
-        if let Some(host) = url.host_str() {
-            // `host_str` keeps IPv6 addresses in brackets.
-            let trimmed = host.trim_start_matches('[').trim_end_matches(']');
-            if let Ok(ip) = trimmed.parse::<IpAddr>() {
-                if !self.policy.permits(ip) {
-                    return Err(Error::AddressRefused(host.to_owned()));
-                }
-            }
-        }
-        Ok(())
+        check_url(self.policy, self.allow_plaintext, url)
     }
 
     /// The underlying client, for callers that need features this wrapper does
@@ -206,5 +204,101 @@ impl Resolve for FilteredResolver {
             }
             Ok(Box::new(permitted.into_iter()) as Addrs)
         })
+    }
+}
+
+/// Scheme and literal-host rules, applied to the initial request and to every
+/// redirect hop.
+fn check_url(policy: AddressPolicy, allow_plaintext: bool, url: &Url) -> Result<(), Error> {
+    match url.scheme() {
+        "https" => {}
+        "http" if allow_plaintext => {}
+        other => {
+            return Err(Error::Scheme {
+                scheme: other.to_owned(),
+            });
+        }
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            if !policy.permits(IpAddr::V4(ip)) {
+                return Err(Error::AddressRefused(ip.to_string()));
+            }
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            if !policy.permits(IpAddr::V6(ip)) {
+                return Err(Error::AddressRefused(ip.to_string()));
+            }
+        }
+        // Hostnames are filtered at connect time by FilteredResolver.
+        Some(url::Host::Domain(_)) => {}
+        None => return Err(Error::AddressRefused(url.to_string())),
+    }
+    Ok(())
+}
+
+/// Error surfaced through reqwest when a redirect target is refused.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RedirectRefused(String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(policy: AddressPolicy, allow_plaintext: bool, raw: &str) -> Result<(), Error> {
+        check_url(
+            policy,
+            allow_plaintext,
+            &Url::parse(raw).expect("test URL parses"),
+        )
+    }
+
+    #[test]
+    fn allows_https_to_a_public_name() {
+        assert!(check(AddressPolicy::DenyLocal, false, "https://example.com/a").is_ok());
+    }
+
+    #[test]
+    fn refuses_plaintext_unless_opted_in() {
+        assert!(matches!(
+            check(AddressPolicy::DenyLocal, false, "http://example.com/"),
+            Err(Error::Scheme { .. })
+        ));
+        assert!(check(AddressPolicy::DenyLocal, true, "http://example.com/").is_ok());
+    }
+
+    #[test]
+    fn refuses_other_schemes() {
+        assert!(matches!(
+            check(AddressPolicy::AllowAll, true, "ftp://example.com/"),
+            Err(Error::Scheme { .. })
+        ));
+    }
+
+    #[test]
+    fn refuses_literal_local_hosts_at_any_hop() {
+        // These are the targets that a resolver hook never sees, which is why
+        // the check has to happen on the URL itself.
+        for url in [
+            "https://127.0.0.1/",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::1]/",
+            "https://[fd00:ec2::254]/",
+            "https://100.64.0.1/",
+        ] {
+            assert!(
+                matches!(
+                    check(AddressPolicy::DenyLocal, false, url),
+                    Err(Error::AddressRefused(_))
+                ),
+                "{url} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn permits_literal_local_hosts_only_on_opt_in() {
+        assert!(check(AddressPolicy::AllowAll, false, "https://127.0.0.1/").is_ok());
     }
 }

@@ -1,0 +1,53 @@
+# rust-tools
+
+Rust libraries we build on. Small, focused, and safe by default.
+
+Everything here is public because it is generally useful, not Blusky-specific
+in any way that matters:
+
+| crate | what it is |
+|---|---|
+| [`egress`](crates/egress) | Outbound HTTP for services that fetch **untrusted URLs**: connect-time address policy (SSRF), no redirects unless opted in, bounded bodies, plaintext refused by default. |
+| [`atproto-identity`](crates/atproto-identity) | [AT Protocol](https://atproto.com) identity resolution: DID → DID document → **PDS endpoint**, for `did:plc` and hostname-form `did:web`, with a TTL cache on top of `egress`. |
+
+The pairing is deliberate. Resolving an identity means fetching a URL whose host
+came from user input, which is the classic SSRF shape; `atproto-identity` is
+useful mostly because `egress` makes that fetch safe.
+
+```rust
+let dir = atproto_identity::Directory::new();
+let identity = dir.lookup_did(&atproto_identity::Did::parse("did:plc:…")?).await?;
+println!("{:?}", identity.pds_endpoint());
+```
+
+## Why the address policy is not just a DNS hook
+
+A guard that only filters resolved addresses has a hole: when a URL's host is
+already an IP literal, there is nothing to resolve, so the resolver hook never
+runs and the connection goes straight to that address. `http://127.0.0.1/` and
+`http://169.254.169.254/` are the two most attractive SSRF targets there are.
+
+`egress` therefore checks twice: the URL's literal host before the request
+exists, and every resolved address at connect time. The second check is what
+makes it rebinding-safe — the addresses returned by the resolver are the
+addresses the connector dials, so a second DNS answer cannot redirect the
+connection. Redirects are off by default, and when enabled each hop is
+re-resolved and re-filtered.
+
+The blocked set is the one our Go client uses, so two services behind the same
+edge cannot disagree about what "local" means: loopback, RFC 1918, link-local
+(including cloud metadata), multicast, unspecified, `0.0.0.0/8`, limited
+broadcast, RFC 6598 CGNAT, IPv6 unique-local, and both NAT64 prefixes.
+
+Residual risk, stated plainly: address filtering cannot defend against a
+malicious recursive resolver that returns a globally routable address fronting
+an internal host. Services resolving fully untrusted identities should also
+restrict egress at the network layer.
+
+## Development
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```

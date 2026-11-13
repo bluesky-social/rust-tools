@@ -1,0 +1,19 @@
+[package]
+name = "egress"
+description = "Outbound HTTP for services that fetch untrusted URLs: connect-time address policy, no redirects unless opted in, and bounded response bodies."
+keywords = ["ssrf", "http", "security", "egress"]
+categories = ["network-programming", "web-programming::http-client"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "macros", "io-util"] }

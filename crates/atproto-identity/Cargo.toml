@@ -1,0 +1,21 @@
+[package]
+name = "atproto-identity"
+description = "AT Protocol identity resolution: DID to DID document to PDS endpoint, with policy-checked egress and a small TTL cache."
+keywords = ["atproto", "bluesky", "did", "identity"]
+categories = ["web-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egress = { path = "../egress", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "time"] }

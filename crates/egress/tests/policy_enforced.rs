@@ -49,6 +49,48 @@ async fn refuses_loopback_under_deny_local() {
 }
 
 #[tokio::test]
+async fn refuses_a_hostname_that_resolves_to_loopback() {
+    // Unlike an IP-literal URL, this request has to go through the connector's
+    // filtered resolver. Keep a real listener running to prove refusal happens
+    // before a connection, not just that the returned error looks plausible.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let err = client(AddressPolicy::DenyLocal)
+        .get(&format!("http://localhost:{}/", addr.port()))
+        .await
+        .expect_err("a name resolving only to loopback must be refused");
+    assert!(
+        matches!(&err, egress::Error::Request(_)),
+        "unexpected error: {err}"
+    );
+
+    let mut source = Some(&err as &dyn std::error::Error);
+    let connector_refused = loop {
+        let Some(error) = source else {
+            break false;
+        };
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            break true;
+        }
+        source = error.source();
+    };
+    assert!(
+        connector_refused,
+        "the connector resolver did not refuse the private address: {err:?}"
+    );
+
+    let connected = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+    assert!(
+        connected.is_err(),
+        "the refused hostname reached its loopback listener: {connected:?}"
+    );
+}
+
+#[tokio::test]
 async fn permits_loopback_when_opted_in() {
     // Proves the filtered resolver still returns usable addresses: if it
     // dropped the port or mangled the list this would fail to connect.
@@ -96,6 +138,61 @@ async fn enforces_the_body_cap() {
     assert!(
         matches!(err, egress::Error::TooLarge(_)),
         "unexpected: {err}"
+    );
+}
+
+#[tokio::test]
+async fn disables_environment_proxies() {
+    if let Ok(url) = std::env::var("EGRESS_PROXY_TEST_URL") {
+        // This child is a separate test process with a fixed environment. The
+        // reqwest control proves the proxy fixture is actually in use.
+        let control = reqwest::Client::builder()
+            .build()
+            .expect("control client builds");
+        let proxied = control
+            .get(&url)
+            .send()
+            .await
+            .expect("proxy response")
+            .bytes()
+            .await
+            .expect("proxy body");
+        assert_eq!(proxied.as_ref(), b"proxy");
+        let body = client(AddressPolicy::AllowAll)
+            .get(&url)
+            .await
+            .expect("direct response");
+        assert_eq!(body, b"direct");
+        return;
+    }
+    let direct = serve_once("HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\ndirect").await;
+    let proxy = serve_once("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nproxy").await;
+    // Never mutate the environment of a multithreaded test process; other
+    // parallel tests and libraries may be reading it at the same time.
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("disables_environment_proxies")
+            .env("EGRESS_PROXY_TEST_URL", format!("http://{direct}/"))
+            .env("HTTP_PROXY", format!("http://{proxy}"))
+            .env("http_proxy", format!("http://{proxy}"))
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .expect("run isolated proxy test")
+    })
+    .await
+    .expect("proxy test task");
+    assert!(
+        output.status.success(),
+        "isolated test failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the child test did not actually run: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

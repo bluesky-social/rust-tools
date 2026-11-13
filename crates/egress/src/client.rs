@@ -53,7 +53,7 @@ pub struct ClientConfig {
     /// the time until response headers instead.
     pub connect_timeout: Duration,
     /// `None` (the default) means a redirect is returned to the caller instead
-    /// of being followed. When set, each hop re-resolves and is re-filtered.
+    /// of being followed. When set, each hop re-resolves and is checked again.
     pub max_redirects: Option<usize>,
     /// Sent as `User-Agent`.
     pub user_agent: String,
@@ -280,10 +280,31 @@ impl Client {
     }
 }
 
-/// Resolves a name and drops any address the policy refuses.
+/// Resolves a name and refuses the complete answer set if any address is blocked.
 #[cfg(not(target_arch = "wasm32"))]
 struct FilteredResolver {
     policy: AddressPolicy,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_answer_set(
+    policy: AddressPolicy,
+    host: &str,
+    addrs: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, std::io::Error> {
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("resolution returned no addresses for {host}"),
+        ));
+    }
+    if let Some(addr) = addrs.iter().find(|addr| !policy.permits(addr.ip())) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("address policy refused {host}: resolved to {}", addr.ip()),
+        ));
+    }
+    Ok(addrs)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -300,16 +321,11 @@ impl Resolve for FilteredResolver {
                 }
             };
             // Port 0 is replaced by the connector with the port from the URL.
-            let permitted: Vec<SocketAddr> =
-                addrs.filter(|addr| policy.permits(addr.ip())).collect();
-            if permitted.is_empty() {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("address policy refused every address for {host}"),
-                ))
-                    as Box<dyn std::error::Error + Send + Sync>);
-            }
-            Ok(Box::new(permitted.into_iter()) as Addrs)
+            // Reject the complete answer set if any address is blocked rather
+            // than filtering out blocked addresses and dialing the remainder.
+            let addrs = validate_answer_set(policy, &host, addrs.collect())
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+            Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
 }
@@ -337,7 +353,7 @@ fn check_url(policy: AddressPolicy, allow_plaintext: bool, url: &Url) -> Result<
                 return Err(Error::AddressRefused(ip.to_string()));
             }
         }
-        // Hostnames are filtered at connect time by FilteredResolver.
+        // Hostnames are policy-checked at connect time by FilteredResolver.
         Some(url::Host::Domain(_)) => {}
         None => return Err(Error::AddressRefused(url.to_string())),
     }
@@ -408,5 +424,45 @@ mod tests {
     #[test]
     fn permits_literal_local_hosts_only_on_opt_in() {
         assert!(check(AddressPolicy::AllowAll, false, "https://127.0.0.1/").is_ok());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn validates_complete_answer_sets() {
+        let public: SocketAddr = "1.1.1.1:0".parse().unwrap();
+        let private: SocketAddr = "10.0.0.1:0".parse().unwrap();
+        assert!(validate_answer_set(AddressPolicy::DenyLocal, "example.com", vec![]).is_err());
+        assert_eq!(
+            validate_answer_set(AddressPolicy::DenyLocal, "example.com", vec![public]).unwrap(),
+            vec![public]
+        );
+        for addrs in [vec![public, private], vec![private, public]] {
+            assert!(
+                validate_answer_set(AddressPolicy::DenyLocal, "example.com", addrs.clone())
+                    .is_err()
+            );
+            assert_eq!(
+                validate_answer_set(AddressPolicy::AllowAll, "example.com", addrs.clone()).unwrap(),
+                addrs
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn refuses_an_answer_set_containing_any_blocked_address() {
+        let public = "1.1.1.1:0".parse().expect("public address parses");
+        let private = "10.0.0.1:0".parse().expect("private address parses");
+        let err = validate_answer_set(
+            AddressPolicy::DenyLocal,
+            "example.com",
+            vec![public, private],
+        )
+        .expect_err("a public fallback must not legitimize a blocked answer");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("10.0.0.1"),
+            "error should name the blocked answer: {err}"
+        );
     }
 }

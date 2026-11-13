@@ -10,7 +10,7 @@ use egress::AddressPolicy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const DOC: &str = r##"{"id":"{did}","alsoKnownAs":["at://alice.example.com"],"service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}]}"##;
+const DOC: &str = r##"{"id":"{did}","alsoKnownAs":["at://alice.example.com","https://example.com/aliases/alice"],"service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}]}"##;
 
 /// A PLC directory that answers any `did:plc:*` path with `doc` and counts hits.
 /// `{did}` in the template is replaced with the DID from the request path, the
@@ -82,6 +82,38 @@ async fn resolves_pds_and_caches() {
         "second lookup must come from the cache"
     );
     assert_eq!(dir.len(), 1);
+    assert_eq!(
+        dir.lookup_did(&did)
+            .await
+            .expect("cached identity")
+            .also_known_as,
+        [
+            "at://alice.example.com",
+            "https://example.com/aliases/alice"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn uses_the_supplied_egress_client() {
+    let (addr, hits) = plc(DOC).await;
+    let client = egress::Client::new(egress::ClientConfig {
+        policy: AddressPolicy::AllowAll,
+        allow_plaintext: true,
+        ..Default::default()
+    })
+    .expect("client builds");
+    // The supplied client, not these defaults, governs network policy.
+    let dir = Directory::with_client(
+        DirectoryConfig {
+            plc_url: format!("http://{addr}/").parse().expect("url"),
+            ..Default::default()
+        },
+        client,
+    );
+    let did = Did::parse("did:plc:ewvi7nxzyoun6zhxrhs64oiz").unwrap();
+    assert!(dir.lookup_did(&did).await.is_ok());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

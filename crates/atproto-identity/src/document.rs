@@ -28,6 +28,9 @@ pub struct Identity {
     /// The handle the document declares, if any. Not verified against the
     /// handle's own resolution; use this to locate, not to authenticate.
     pub handle: Option<String>,
+    /// All `alsoKnownAs` entries, in document order. These are declarations,
+    /// not independently verified claims.
+    pub also_known_as: Vec<String>,
     /// Services keyed by id.
     pub services: HashMap<String, ServiceEndpoint>,
 }
@@ -44,6 +47,7 @@ impl Identity {
     pub fn pds_endpoint(&self) -> Option<&str> {
         self.services
             .get("#atproto_pds")
+            .or_else(|| self.services.get(&format!("{}#atproto_pds", self.did)))
             .filter(|service| service.service_type == "AtprotoPersonalDataServer")
             .filter(|service| match Url::parse(&service.endpoint) {
                 Ok(url) => url.host().is_some() && matches!(url.scheme(), "http" | "https"),
@@ -66,6 +70,7 @@ impl Identity {
         Self {
             did,
             handle,
+            also_known_as: doc.also_known_as,
             services,
         }
     }
@@ -110,6 +115,7 @@ mod tests {
             Identity::from_document(Did::parse("did:plc:ewvi7nxzyoun6zhxrhs64oiz").unwrap(), doc);
         assert_eq!(identity.pds_endpoint(), Some("https://pds.example.com"));
         assert_eq!(identity.handle.as_deref(), Some("alice.example.com"));
+        assert_eq!(identity.also_known_as, ["at://alice.example.com"]);
         assert_eq!(identity.services.len(), 2);
     }
 
@@ -135,6 +141,14 @@ mod endpoint_tests {
     fn accepts_a_real_pds_entry() {
         let id = identity(
             r##"{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}"##,
+        );
+        assert_eq!(id.pds_endpoint(), Some("https://pds.example.com"));
+    }
+
+    #[test]
+    fn accepts_a_fully_qualified_service_id() {
+        let id = identity(
+            r##"{"id":"did:plc:abc#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}"##,
         );
         assert_eq!(id.pds_endpoint(), Some("https://pds.example.com"));
     }

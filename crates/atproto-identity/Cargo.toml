@@ -15,7 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+web-time = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "time"] }

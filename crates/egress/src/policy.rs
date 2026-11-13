@@ -6,7 +6,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AddressPolicy {
     /// Refuse local and private ranges. The default, and what production
-    /// services fetching untrusted URLs should use.
+    /// services fetching untrusted URLs should use. The Cloudflare backend
+    /// relies on the platform for filtering DNS-resolved addresses; see
+    /// `Client::new_cloudflare`.
     #[default]
     DenyLocal,
     /// Permit any address. Only for tests, local development, and services

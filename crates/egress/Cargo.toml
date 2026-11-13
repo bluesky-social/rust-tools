@@ -23,7 +23,7 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-wasm-streams = "0.6"
+wasm-streams = "0.7"
 web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "Headers", "ReadableStream", "RequestInit", "RequestRedirect", "Response", "WorkerGlobalScope"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

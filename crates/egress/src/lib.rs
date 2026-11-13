@@ -8,10 +8,10 @@
 //!
 //! This crate makes the safe configuration the default one:
 //!
-//! - [`AddressPolicy::DenyLocal`] is the default. Resolution is filtered at
-//!   connect time, so the addresses the connector dials are the addresses that
-//!   were checked — a DNS-rebinding flip between check and connect cannot help
-//!   an attacker.
+//! - [`AddressPolicy::DenyLocal`] is the default. DNS answers are checked at
+//!   connect time and rejected in full if any address is blocked. The connector
+//!   dials only addresses that were checked, preventing DNS rebinding between
+//!   check and connect.
 //! - Redirects are **not** followed unless you ask for them, and when you do the
 //!   policy is re-applied to every hop because each hop resolves again.
 //! - Response bodies are capped, so a hostile server cannot stream forever.

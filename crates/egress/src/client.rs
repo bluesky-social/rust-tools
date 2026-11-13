@@ -1,12 +1,17 @@
 //! A request client whose connection targets are policy-checked.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::SocketAddr;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest::redirect::Policy;
-use reqwest::Url;
+use url::Url;
 
 use crate::policy::AddressPolicy;
 
@@ -15,8 +20,17 @@ use crate::policy::AddressPolicy;
 pub enum Error {
     #[error("invalid URL: {0}")]
     Url(#[from] url::ParseError),
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[cfg(target_arch = "wasm32")]
+    #[error("request failed: {0}")]
+    Request(String),
+    #[error("unsupported configuration: {0}")]
+    UnsupportedConfiguration(&'static str),
+    #[cfg(target_arch = "wasm32")]
+    #[error("request timed out after {0:?}")]
+    Timeout(Duration),
     #[error("address policy refused every resolved address for {0}")]
     AddressRefused(String),
     #[error("scheme {scheme}:// is not permitted")]
@@ -34,7 +48,9 @@ pub struct ClientConfig {
     pub policy: AddressPolicy,
     /// Total time allowed for a request, including the body.
     pub timeout: Duration,
-    /// Time allowed to establish the connection.
+    /// Time allowed to establish the connection. On Cloudflare Workers the
+    /// connection phase is not observable, so this conservatively bounds
+    /// the time until response headers instead.
     pub connect_timeout: Duration,
     /// `None` (the default) means a redirect is returned to the caller instead
     /// of being followed. When set, each hop re-resolves and is re-filtered.
@@ -63,59 +79,125 @@ impl Default for ClientConfig {
     }
 }
 
-/// An HTTP client that refuses to connect to addresses its policy disallows.
+/// A buffered HTTP response, including non-success responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Response {
+    /// The HTTP status code.
+    pub status: u16,
+    /// The complete body, bounded by [`ClientConfig::max_response_bytes`].
+    pub body: Vec<u8>,
+}
+
+/// An HTTP client with a configured address policy. Native connections are
+/// filtered directly; the explicit Cloudflare backend relies on the platform
+/// to enforce public-only routing for resolved addresses.
 #[derive(Debug, Clone)]
 pub struct Client {
+    #[cfg(not(target_arch = "wasm32"))]
     inner: reqwest::Client,
+    #[cfg(target_arch = "wasm32")]
+    inner: crate::worker::CloudflareClient,
     policy: AddressPolicy,
     max_response_bytes: u64,
     allow_plaintext: bool,
 }
 
 impl Client {
-    /// Build a client. Fails only if the underlying TLS backend cannot start.
+    /// Build a native client. Fails only if the underlying TLS backend cannot start.
+    ///
+    /// On `wasm32`, this always returns [`Error::UnsupportedConfiguration`]. A
+    /// Worker caller must explicitly opt in with `Client::new_cloudflare` after
+    /// establishing that constructor's documented platform guarantees.
     pub fn new(config: ClientConfig) -> Result<Self, Error> {
-        let redirect = match config.max_redirects {
-            None | Some(0) => Policy::none(),
-            Some(max) => {
-                let policy = config.policy;
-                let allow_plaintext = config.allow_plaintext;
-                Policy::custom(move |attempt| {
-                    if attempt.previous().len() > max {
-                        return attempt.error("too many redirects");
-                    }
-                    // A redirect is a second, attacker-chosen URL. Everything the
-                    // first URL had to satisfy applies to it too — including the
-                    // literal-host check, since reqwest does not resolve IP
-                    // literals and would otherwise connect straight to one.
-                    match check_url(policy, allow_plaintext, attempt.url()) {
-                        Ok(()) => attempt.follow(),
-                        Err(err) => attempt.error(RedirectRefused(err.to_string())),
-                    }
-                })
-            }
-        };
-        let inner = reqwest::Client::builder()
-            // The connection target check happens here, at connect time: the
-            // addresses this resolver returns are the ones the connector dials,
-            // so a second DNS answer cannot point the connection somewhere else.
-            .dns_resolver(Arc::new(FilteredResolver {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = config;
+            Err(Error::UnsupportedConfiguration(
+                "Client::new is unavailable on wasm32; use Client::new_cloudflare only with the required Cloudflare public-only platform configuration",
+            ))
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let redirect = match config.max_redirects {
+                None | Some(0) => Policy::none(),
+                Some(max) => {
+                    let policy = config.policy;
+                    let allow_plaintext = config.allow_plaintext;
+                    Policy::custom(move |attempt| {
+                        if attempt.previous().len() > max {
+                            return attempt.error("too many redirects");
+                        }
+                        // A redirect is a second, attacker-chosen URL. Everything the
+                        // first URL had to satisfy applies to it too — including the
+                        // literal-host check, since reqwest does not resolve IP
+                        // literals and would otherwise connect straight to one.
+                        match check_url(policy, allow_plaintext, attempt.url()) {
+                            Ok(()) => attempt.follow(),
+                            Err(err) => attempt.error(RedirectRefused(err.to_string())),
+                        }
+                    })
+                }
+            };
+            let inner = reqwest::Client::builder()
+                // The connection target check happens here, at connect time: the
+                // addresses this resolver returns are the ones the connector dials,
+                // so a second DNS answer cannot point the connection somewhere else.
+                .dns_resolver(Arc::new(FilteredResolver {
+                    policy: config.policy,
+                }))
+                .redirect(redirect)
+                .timeout(config.timeout)
+                .connect_timeout(config.connect_timeout)
+                .user_agent(config.user_agent)
+                // A redirect target must not receive credentials meant for the
+                // original origin.
+                .referer(false)
+                // Implicit proxies defeat the address policy: with a proxy
+                // configured, the connection goes to the proxy and the proxy resolves
+                // the destination, so nothing in this crate ever sees the address
+                // that is eventually fetched. Requests must not be routed anywhere
+                // this policy cannot inspect.
+                .no_proxy()
+                .build()?;
+            Ok(Self {
+                inner,
                 policy: config.policy,
-            }))
-            .redirect(redirect)
-            .timeout(config.timeout)
-            .connect_timeout(config.connect_timeout)
-            .user_agent(config.user_agent)
-            // A redirect target must not receive credentials meant for the
-            // original origin.
-            .referer(false)
-            // Implicit proxies defeat the address policy: with a proxy
-            // configured, the connection goes to the proxy and the proxy resolves
-            // the destination, so nothing in this crate ever sees the address
-            // that is eventually fetched. Requests must not be routed anywhere
-            // this policy cannot inspect.
-            .no_proxy()
-            .build()?;
+                max_response_bytes: config.max_response_bytes,
+                allow_plaintext: config.allow_plaintext,
+            })
+        }
+    }
+
+    /// Build the explicitly platform-dependent Cloudflare Workers backend.
+    ///
+    /// The caller **MUST** run this only in a Cloudflare Worker configured with
+    /// the `global_fetch_strictly_public` compatibility flag **and** public-only
+    /// outbound routing. Calling this constructor is an assertion that both
+    /// external requirements hold; the crate cannot inspect that configuration.
+    ///
+    /// Rust checks the URL scheme and literal IP hosts. It cannot observe or
+    /// filter the addresses selected by Worker DNS resolution: resolved-address
+    /// enforcement is delegated entirely to Cloudflare. A valid-looking
+    /// hostname string is **not** evidence of connect-time DNS policy
+    /// enforcement, and this backend does not claim native-equivalent SSRF
+    /// guarantees. Do not use it without the platform requirements above.
+    ///
+    /// Only [`AddressPolicy::DenyLocal`] is supported. `AllowAll` is rejected
+    /// because mandated public-only routing cannot provide its local-address
+    /// opt-in. `max_redirects` must be `None` or `Some(0)`: Worker requests use
+    /// manual redirect handling and return the redirect as a non-success
+    /// response rather than following it. HTTP remains opt-in through
+    /// `allow_plaintext`, with the same loss of transport integrity as native.
+    ///
+    /// `timeout` is one total deadline covering fetch and streaming the body;
+    /// expiry aborts the request. Workers does not expose a separate connection
+    /// phase, so `connect_timeout` is conservatively enforced until response
+    /// headers arrive; a slow server may time out after connecting. Timeouts
+    /// above the Worker timer range are rejected.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new_cloudflare(config: ClientConfig) -> Result<Self, Error> {
+        let inner = crate::worker::CloudflareClient::new(&config)?;
         Ok(Self {
             inner,
             policy: config.policy,
@@ -124,31 +206,60 @@ impl Client {
         })
     }
 
+    /// Fetch `url`, returning its status and bounded body for every HTTP status.
+    ///
+    /// Unlike [`Client::get_bytes`], this does not turn non-2xx statuses into
+    /// [`Error::Status`]. Redirects are still governed by `max_redirects`; with
+    /// the default configuration, the redirect response itself is returned.
+    pub async fn get_response(&self, url: Url) -> Result<Response, Error> {
+        self.fetch(url, false).await
+    }
+
     /// Fetch `url`, returning the body, refusing redirects unless configured
     /// and refusing bodies over the configured cap.
     pub async fn get_bytes(&self, url: Url) -> Result<Vec<u8>, Error> {
+        self.fetch(url, true).await.map(|response| response.body)
+    }
+
+    async fn fetch(&self, url: Url, require_success: bool) -> Result<Response, Error> {
         self.check_url(&url)?;
-        let mut response = self.inner.get(url.clone()).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Status {
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut response = self.inner.get(url.clone()).send().await?;
+            let status = response.status();
+            // Preserve get_bytes' status-before-body behavior. get_response
+            // deliberately buffers non-success bodies as well.
+            if require_success && !status.is_success() {
+                return Err(Error::Status {
+                    status: status.as_u16(),
+                    url: url.to_string(),
+                });
+            }
+            if let Some(len) = response.content_length() {
+                if len > self.max_response_bytes {
+                    return Err(Error::TooLarge(len));
+                }
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if body.len() as u64 + chunk.len() as u64 > self.max_response_bytes {
+                    return Err(Error::TooLarge(self.max_response_bytes));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(Response {
                 status: status.as_u16(),
-                url: url.to_string(),
-            });
+                body,
+            })
         }
-        if let Some(len) = response.content_length() {
-            if len > self.max_response_bytes {
-                return Err(Error::TooLarge(len));
-            }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.inner
+                .get(url, require_success, self.max_response_bytes)
+                .await
         }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if body.len() as u64 + chunk.len() as u64 > self.max_response_bytes {
-                return Err(Error::TooLarge(self.max_response_bytes));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
     }
 
     /// Parse and fetch in one step.
@@ -170,10 +281,12 @@ impl Client {
 }
 
 /// Resolves a name and drops any address the policy refuses.
+#[cfg(not(target_arch = "wasm32"))]
 struct FilteredResolver {
     policy: AddressPolicy,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Resolve for FilteredResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let policy = self.policy;
@@ -232,6 +345,7 @@ fn check_url(policy: AddressPolicy, allow_plaintext: bool, url: &Url) -> Result<
 }
 
 /// Error surfaced through reqwest when a redirect target is refused.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct RedirectRefused(String);

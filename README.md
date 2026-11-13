@@ -7,7 +7,7 @@ in any way that matters:
 
 | crate | what it is |
 |---|---|
-| [`egress`](crates/egress) | Outbound HTTP for services that fetch **untrusted URLs**: connect-time address policy (SSRF), no redirects unless opted in, bounded bodies, plaintext refused by default. |
+| [`egress`](crates/egress) | Outbound HTTP for services that fetch **untrusted URLs**: native connect-time address policy (SSRF), bounded bodies, plaintext refused by default. |
 | [`atproto-identity`](crates/atproto-identity) | [AT Protocol](https://atproto.com) identity resolution: DID → DID document → **PDS endpoint**, for `did:plc` and hostname-form `did:web`, with a TTL cache on top of `egress`. |
 
 The pairing is deliberate. Resolving an identity means fetching a URL whose host
@@ -51,6 +51,33 @@ connection goes to the proxy and the proxy resolves the destination, so a
 resolver hook never sees the address that is eventually fetched. There is also
 no accessor for the underlying `reqwest::Client` — handing one out would skip the
 URL checks and reintroduce the literal-host hole.
+
+## Cloudflare Workers
+
+The WebAssembly backend is an **explicit platform-trust opt-in**: the caller
+must use Cloudflare Workers with `global_fetch_strictly_public` and only public
+outbound routing. Unlike the native backend, Worker `fetch` does not expose a
+connect-time DNS resolver or pin the checked IP. The Worker backend relies on
+the platform for the connected address; it does not independently guarantee
+that its resolved-address policy is identical to the native blocked-IP table.
+Do not use it in a runtime that can reach private networks. `wrangler dev` may
+allow local network access even where production Workers do not, so it is not
+proof of the production egress policy.
+
+Under their default policy, both backends refuse unsafe literal addresses and
+limit response sizes. The Worker backend does not follow redirects. In a Worker,
+construct the explicit client and pass it to the identity directory:
+
+```rust
+let client = egress::Client::new_cloudflare(egress::ClientConfig::default())?;
+let directory = atproto_identity::Directory::with_client(
+    atproto_identity::DirectoryConfig::default(),
+    client.clone(),
+);
+```
+
+`Directory::new` and `Default` are native-only; `Directory::with_config` returns
+an error on WebAssembly rather than selecting a less restrictive backend.
 
 ## Development
 

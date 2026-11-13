@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egress::{AddressPolicy, Client, ClientConfig};
 use url::Url;
+use web_time::Instant;
 
 use crate::did::{Did, DidError};
 use crate::document::{Document, Identity};
@@ -84,11 +85,16 @@ pub struct Directory {
 
 impl Directory {
     /// A directory pointed at the public PLC directory with the default policy.
+    /// On WebAssembly, construct a platform-specific egress client and use
+    /// [`Directory::with_client`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
         Self::with_config(DirectoryConfig::default()).expect("default client builds")
     }
 
-    /// A directory with explicit configuration.
+    /// A directory with explicit configuration. On WebAssembly this returns
+    /// an unsupported-configuration error; use [`Directory::with_client`]
+    /// with an explicitly configured platform client instead.
     pub fn with_config(config: DirectoryConfig) -> Result<Self, Error> {
         let client = Client::new(ClientConfig {
             policy: config.address_policy,
@@ -96,14 +102,25 @@ impl Directory {
             allow_plaintext: config.allow_plaintext,
             ..ClientConfig::default()
         })?;
-        Ok(Self {
+        Ok(Self::with_client(config, client))
+    }
+
+    /// Construct a directory with an already-configured egress client.
+    ///
+    /// The supplied client controls outbound policy, timeouts, and plaintext
+    /// permissions. The corresponding fields in `config` are not applied to
+    /// it; `config` supplies the PLC URL and cache settings. This also allows
+    /// an explicitly configured platform-specific client to be reused for
+    /// identity resolution and subsequent PDS requests.
+    pub fn with_client(config: DirectoryConfig, client: Client) -> Self {
+        Self {
             plc_url: config.plc_url,
             client,
             ttl: config.ttl,
             capacity: config.capacity.max(1),
             cache: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
-        })
+        }
     }
 
     /// Resolve a DID, using the cache when the entry is still fresh.
@@ -235,6 +252,7 @@ impl Directory {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Default for Directory {
     fn default() -> Self {
         Self::new()

@@ -36,7 +36,7 @@ jobs:
     # The Worker backend must compile for the declared MSRV too.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
           echo "MSRV=$msrv" >> "$GITHUB_ENV"

@@ -202,12 +202,14 @@ impl Directory {
         let url = match did.method() {
             "plc" => {
                 let mut url = self.plc_url.clone();
-                // `did:plc:abc` -> `{plc}/did:plc:abc`. Path segments are
-                // percent-encoded so an identifier cannot escape the base path.
+                // `did:plc:abc` -> `{plc}/did:plc:abc`: one path segment holding
+                // the whole DID. Splitting on ':' would produce
+                // `{plc}/did/plc/abc`, which is a 404 — the colons are part of
+                // the identifier, not separators.
                 url.path_segments_mut()
                     .map_err(|_| Error::Url(url::ParseError::RelativeUrlWithCannotBeABaseBase))?
                     .pop_if_empty()
-                    .extend(did.as_str().split(':'));
+                    .push(did.as_str());
                 url
             }
             "web" => {
@@ -223,5 +225,47 @@ impl Directory {
 impl Default for Directory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir() -> Directory {
+        Directory::with_config(DirectoryConfig {
+            plc_url: Url::parse("https://plc.directory").unwrap(),
+            ..DirectoryConfig::default()
+        })
+        .expect("directory builds")
+    }
+
+    #[test]
+    fn plc_document_url_keeps_the_did_as_one_segment() {
+        let did = Did::parse("did:plc:ewvi7nxzyoun6zhxrhs64oiz").unwrap();
+        assert_eq!(
+            dir().document_url(&did).unwrap().as_str(),
+            "https://plc.directory/did:plc:ewvi7nxzyoun6zhxrhs64oiz"
+        );
+    }
+
+    #[test]
+    fn custom_plc_base_keeps_its_path() {
+        let mut d = dir();
+        d.plc_url = Url::parse("https://plc.internal.example/directory/").unwrap();
+        let did = Did::parse("did:plc:ewvi7nxzyoun6zhxrhs64oiz").unwrap();
+        assert_eq!(
+            d.document_url(&did).unwrap().as_str(),
+            "https://plc.internal.example/directory/did:plc:ewvi7nxzyoun6zhxrhs64oiz"
+        );
+    }
+
+    #[test]
+    fn web_document_url_uses_well_known() {
+        let did = Did::parse("did:web:example.com").unwrap();
+        assert_eq!(
+            dir().document_url(&did).unwrap().as_str(),
+            "https://example.com/.well-known/did.json"
+        );
     }
 }

@@ -44,6 +44,12 @@ malicious recursive resolver that returns a globally routable address fronting
 an internal host. Services resolving fully untrusted identities should also
 restrict egress at the network layer.
 
+Implicit proxies are disabled for the same reason: with `HTTP_PROXY` set, the
+connection goes to the proxy and the proxy resolves the destination, so a
+resolver hook never sees the address that is eventually fetched. There is also
+no accessor for the underlying `reqwest::Client` — handing one out would skip the
+URL checks and reintroduce the literal-host hole.
+
 ## Development
 
 ```sh

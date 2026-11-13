@@ -94,6 +94,12 @@ impl Client {
             // A redirect target must not receive credentials meant for the
             // original origin.
             .referer(false)
+            // Implicit proxies defeat the address policy: with a proxy
+            // configured, the connection goes to the proxy and the proxy resolves
+            // the destination, so nothing in this crate ever sees the address
+            // that is eventually fetched. Requests must not be routed anywhere
+            // this policy cannot inspect.
+            .no_proxy()
             .build()?;
         Ok(Self {
             inner,
